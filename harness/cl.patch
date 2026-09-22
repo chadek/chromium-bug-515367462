@@ -1,0 +1,138 @@
+--- a/components/input/touch_action_filter.h
++++ b/components/input/touch_action_filter.h
+@@ -87,6 +87,13 @@
+   void IncreaseActiveTouches();
+   void DecreaseActiveTouches();
+ 
++  // Drops an active-touch count that can never be decremented, resetting the
++  // touch action if that leaves no touches active. Called by InputRouterImpl
++  // once the touch event queue has drained: no further touch acks are coming
++  // at that point, so any count still outstanding belongs to a touch sequence
++  // the platform abandoned without a terminal touchend/touchcancel.
++  void ResetActiveTouchesIfStale();
++
+   void ForceResetTouchActionForTest();
+ 
+  private:
+--- a/components/input/touch_action_filter.cc
++++ b/components/input/touch_action_filter.cc
+@@ -344,6 +344,28 @@
+   num_of_active_touches_--;
+ }
+ 
++void TouchActionFilter::ResetActiveTouchesIfStale() {
++  if (num_of_active_touches_ <= 0) {
++    return;
++  }
++  // The touch queue has drained, so every sequence we counted has been fully
++  // acked -- except one that never produced a terminal touchend or
++  // touchcancel. Several browser-side paths can swallow the rest of a
++  // sequence: on Android, RenderWidgetHostViewAndroid::OnTouchEvent() drops
++  // the event outright whenever the gesture provider rejects it, which is what
++  // an OEM system gesture (e.g. the three-finger screenshot on some devices)
++  // triggers when it claims the gesture mid-sequence.
++  //
++  // Left alone, the leaked count stops ReportAndResetTouchAction() from ever
++  // resetting again, so the first touch-action: none element the user touches
++  // afterwards pins |allowed_touch_action_| to kNone and scrolling stays dead
++  // for the lifetime of the widget.
++  TRACE_EVENT1("input", "TouchActionFilter::ResetActiveTouchesIfStale", "num",
++               num_of_active_touches_);
++  num_of_active_touches_ = 0;
++  ReportAndResetTouchAction();
++}
++
+ void TouchActionFilter::ReportAndResetTouchAction() {
+   if (num_of_active_touches_ <= 0) {
+     ResetTouchAction();
+--- a/components/input/input_router_impl.cc
++++ b/components/input/input_router_impl.cc
+@@ -524,6 +524,14 @@
+   if (event.event.IsTouchSequenceEnd()) {
+     touch_action_filter_.DecreaseActiveTouches();
+     touch_action_filter_.ReportAndResetTouchAction();
++    // The acked event has already been removed from the queue, so an empty
++    // queue here means no more touch acks are coming. Any active-touch count
++    // still outstanding belongs to a sequence that was abandoned without a
++    // terminal touchend/touchcancel and would otherwise pin the touch action
++    // forever, permanently disabling scrolling.
++    if (touch_event_queue_.Empty()) {
++      touch_action_filter_.ResetActiveTouchesIfStale();
++    }
+     UpdateTouchAckTimeoutEnabled();
+   }
+ }
+--- a/components/input/touch_action_filter_unittest.cc
++++ b/components/input/touch_action_filter_unittest.cc
+@@ -1231,6 +1231,71 @@
+   EXPECT_FALSE(filter_.allowed_touch_action().has_value());
+ }
+ 
++// Regression test for crbug.com/515367462. If a touch sequence is abandoned
++// without a terminal touchend/touchcancel -- which happens when a browser-side
++// path swallows the rest of the sequence, e.g. an Android OEM system gesture
++// claiming a three-finger press -- its DecreaseActiveTouches() never runs. The
++// leaked count must not keep the touch action pinned forever, otherwise the
++// next touch-action: none element the user touches disables scrolling for good.
++TEST_F(TouchActionFilterTest, AbandonedTouchSequenceDoesNotPinTouchAction) {
++  filter_.OnHasTouchEventHandlers(true);
++
++  // A touch sequence starts and is acked, then is abandoned: no touch end ack.
++  filter_.OnSetTouchAction(cc::TouchAction::kAuto);
++  filter_.IncreaseActiveTouches();
++
++  // The user now touches a touch-action: none region and lifts off. The touch
++  // queue has drained by the time this end ack is handled.
++  filter_.OnSetTouchAction(cc::TouchAction::kNone);
++  filter_.IncreaseActiveTouches();
++  filter_.DecreaseActiveTouches();
++  filter_.ReportAndResetTouchAction();
++  filter_.ResetActiveTouchesIfStale();
++
++  EXPECT_FALSE(filter_.allowed_touch_action().has_value());
++
++  // Scrolling must work again on the next sequence.
++  filter_.OnSetTouchAction(cc::TouchAction::kAuto);
++  filter_.IncreaseActiveTouches();
++  WebGestureEvent scroll_begin =
++      SyntheticWebGestureEventBuilder::BuildScrollBegin(0, -5, kSourceDevice);
++  WebGestureEvent scroll_update =
++      SyntheticWebGestureEventBuilder::BuildScrollUpdate(0, -5, 0,
++                                                         kSourceDevice);
++  WebGestureEvent scroll_end = SyntheticWebGestureEventBuilder::Build(
++      WebInputEvent::Type::kGestureScrollEnd, kSourceDevice);
++  EXPECT_EQ(filter_.FilterGestureEvent(&scroll_begin),
++            FilterGestureEventResult::kAllowed);
++  EXPECT_EQ(filter_.FilterGestureEvent(&scroll_update),
++            FilterGestureEventResult::kAllowed);
++  EXPECT_EQ(filter_.FilterGestureEvent(&scroll_end),
++            FilterGestureEventResult::kAllowed);
++  filter_.DecreaseActiveTouches();
++  filter_.ReportAndResetTouchAction();
++}
++
++// A count that is still legitimately outstanding -- the ack for a second touch
++// start arriving before the ack for the first touch end -- must be left alone.
++TEST_F(TouchActionFilterTest, StaleResetLeavesLiveTouchesAlone) {
++  filter_.OnHasTouchEventHandlers(true);
++  filter_.OnSetTouchAction(cc::TouchAction::kPanY);
++  filter_.IncreaseActiveTouches();
++  filter_.OnSetTouchAction(cc::TouchAction::kPan);
++  filter_.IncreaseActiveTouches();
++
++  // First touch end acked; the second sequence is still in the queue, so
++  // InputRouterImpl would not call ResetActiveTouchesIfStale() here.
++  filter_.DecreaseActiveTouches();
++  filter_.ReportAndResetTouchAction();
++  EXPECT_TRUE(filter_.allowed_touch_action().has_value());
++  EXPECT_EQ(filter_.allowed_touch_action().value(), cc::TouchAction::kPanY);
++
++  filter_.DecreaseActiveTouches();
++  filter_.ReportAndResetTouchAction();
++  filter_.ResetActiveTouchesIfStale();
++  EXPECT_FALSE(filter_.allowed_touch_action().has_value());
++}
++
+ // If the renderer is busy, the gesture event might have come before the
+ // OnHasTouchEventHanlders IPC is received. In this case, we should allow all
+ // the gestures.
