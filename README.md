@@ -5,6 +5,10 @@
 
 A reproduction rig, a root cause, and a fix.
 
+Upstream bug: <https://issues.chromium.org/issues/515367462>.
+`BUG_COMMENT.md` is the write-up for that thread; `harness/COMMIT_MSG.txt` and
+`harness/build/cl.patch` are the Gerrit CL.
+
 ## TL;DR
 
 `TouchActionFilter::num_of_active_touches_` is a plain counter. It is
