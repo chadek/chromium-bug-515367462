@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>crbug 515367462 repro</title>
+<style>
+  html, body { margin:0; padding:0; }
+  body { height: 4000px; font: 14px sans-serif;
+         background: repeating-linear-gradient(#fff 0 49px, #ddd 49px 50px); }
+  #top    { height: 200px; padding: 8px; box-sizing: border-box; }
+  #canvas { display:block; width: 320px; height: 300px; margin-left: 40px;
+            border: 2px solid #333; background:#fafafa;
+            touch-action: none; }   /* <-- as in the MDN "Using Pointer Events" demo */
+  #bottom { height: 3000px; padding: 8px; }
+  .marker { position: fixed; top: 0; right: 0; background: #000; color:#0f0;
+            font: 12px monospace; padding: 4px; z-index: 99; white-space: pre; }
+</style>
+</head>
+<body>
+<div id="top">
+  <h1>crbug.com/515367462 repro page</h1>
+  <p>Background area (touch-action: auto) &mdash; drag here to scroll.</p>
+</div>
+
+<canvas id="canvas" width="320" height="300"></canvas>
+
+<div id="bottom">
+  <p>More background area (touch-action: auto) &mdash; drag here to scroll.</p>
+</div>
+
+<div class="marker" id="marker">scrollY 0</div>
+
+<script>
+// ---- instrumentation -------------------------------------------------------
+window.__log = [];
+function log(kind, e) {
+  window.__log.push({
+    t: performance.now(), kind: kind, type: e.type,
+    pointerId: e.pointerId, pointerType: e.pointerType,
+    target: e.target.id || e.target.tagName,
+    x: Math.round(e.clientX || 0), y: Math.round(e.clientY || 0)
+  });
+}
+window.__clearLog = () => { window.__log = []; };
+
+// ---- MDN "Using Pointer Events" style multi-touch canvas drawing ------------
+const el  = document.getElementById("canvas");
+const ctx = el.getContext("2d");
+const ongoing = [];
+
+function idx(id) { return ongoing.findIndex(p => p.pointerId === id); }
+function color(id) { return ["red","blue","green","purple"][id % 4]; }
+
+el.addEventListener("pointerdown", (e) => {
+  log("canvas", e);
+  e.preventDefault();
+  ongoing.push({ pointerId: e.pointerId, x: e.clientX, y: e.clientY });
+}, false);
+
+el.addEventListener("pointermove", (e) => {
+  log("canvas", e);
+  e.preventDefault();
+  const i = idx(e.pointerId);
+  if (i < 0) return;
+  const p = ongoing[i];
+  const r = el.getBoundingClientRect();
+  ctx.beginPath();
+  ctx.moveTo(p.x - r.left, p.y - r.top);
+  ctx.lineTo(e.clientX - r.left, e.clientY - r.top);
+  ctx.strokeStyle = color(e.pointerId);
+  ctx.lineWidth = 4;
+  ctx.stroke();
+  ongoing[i] = { pointerId: e.pointerId, x: e.clientX, y: e.clientY };
+}, false);
+
+function end(e) {
+  log("canvas", e);
+  e.preventDefault();
+  const i = idx(e.pointerId);
+  if (i >= 0) ongoing.splice(i, 1);
+}
+el.addEventListener("pointerup", end, false);
+el.addEventListener("pointercancel", end, false);
+
+// ---- passive observers on the document (do NOT preventDefault) -------------
+for (const t of ["pointerdown","pointerup","pointercancel"]) {
+  document.addEventListener(t, (e) => { if (e.target !== el) log("doc", e); },
+                            { passive: true });
+}
+for (const t of ["touchstart","touchend","touchcancel"]) {
+  document.addEventListener(t, (e) => {
+    window.__log.push({ t: performance.now(), kind: "doc-touch", type: e.type,
+                        touches: e.touches.length,
+                        changed: e.changedTouches.length });
+  }, { passive: true });
+}
+
+addEventListener("scroll", () => {
+  document.getElementById("marker").textContent = "scrollY " + Math.round(scrollY);
+}, { passive: true });
+</script>
+</body>
+</html>

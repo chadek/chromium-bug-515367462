@@ -1,0 +1,46 @@
+Input: recover from a leaked active-touch count in TouchActionFilter
+
+TouchActionFilter::num_of_active_touches_ is incremented when a touch
+sequence start is acked and decremented when a touch sequence end is
+acked. Nothing recovers it if a sequence is abandoned, i.e. if the
+browser never sees a terminal touchend/touchcancel for it.
+
+That happens. RenderWidgetHostViewAndroid::OnTouchEvent() returns
+without calling RouteOrForwardTouchEvent() whenever the gesture provider
+rejects the event -- FilteredGestureProvider::OnTouchEvent() reports
+failure when TouchDispositionGestureFilter::OnGesturePacket() does not
+return SUCCESS, including the EMPTY_GESTURE_SEQUENCE a cancel produces
+against an already-empty sequence queue. Earlier branches of the same
+function (touch handles, stylus text selection, overscroll, input
+transfer to Viz) can also swallow a terminal event mid-sequence. An OEM
+system gesture that claims the gesture, such as the three-finger
+screenshot on some Android devices, is one way to reach this.
+
+Once the count leaks, ReportAndResetTouchAction() never resets again,
+because it only resets when the count is <= 0. The first
+touch-action: none element the user touches afterwards then pins
+allowed_touch_action_ to kNone, and FilterGestureEvent() drops every
+subsequent GestureScrollBegin/GestureScrollUpdate. Scrolling stays
+broken for the lifetime of the widget. On the page from the bug report
+-- an MDN pointer-events demo whose canvas is touch-action: none --
+the tab becomes unusable until the browser is killed.
+
+Add TouchActionFilter::ResetActiveTouchesIfStale(), and call it from
+InputRouterImpl::OnTouchEventAck() when the touch event queue has
+drained. The acked event has already been erased from
+outstanding_touches_ by then, so an empty queue means no further touch
+acks are coming and any remaining count cannot belong to a live
+sequence.
+
+This keeps the guarantee covered by
+TouchActionFilterTest.ResetTouchActionWithActiveTouch: when the ack for
+a second touch start arrives before the ack for the first touch end, the
+queue is not empty, the reset is not called, and the touch action
+correctly survives until the last finger is up.
+
+Reproduced and the mechanism confirmed from the browser's own input
+trace, using a DevTools-Protocol rig that injects an abandoned
+multi-touch sequence followed by a touch on a touch-action: none canvas;
+the counter is pinned at 1 and every later scroll is dropped.
+
+Bug: 515367462
